@@ -18,7 +18,13 @@ try:
     import nidaqmx
     from nidaqmx.system import System
     REAL_DAQ = True
-except ImportError:
+except ImportError as e:
+    print("nidaqmx ImportError. Running in simulation mode.")
+    print("Détail de l'erreur :", e)
+    REAL_DAQ = False
+except Exception as e:
+    print("Erreur inattendue à l'import de nidaqmx !")
+    print("Détail :", e)
     REAL_DAQ = False
 
 CHANNEL_NAMES = {
@@ -91,7 +97,7 @@ class ConfigTab(QWidget):
             system = System.local()
             devs = [d.name for d in system.devices]
         else:
-            devs = ['Dev1', 'Dev2']
+            devs = []
         self.device_combo.addItems(devs)
 
     def device_changed(self, idx):
