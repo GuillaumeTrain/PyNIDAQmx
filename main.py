@@ -1,31 +1,21 @@
 import sys
-import threading
-import time
-import numpy as np
-import csv
-import os
-import pyqtgraph as pg
-
-from queue import Queue
+import nidaqmx
+from nidaqmx.constants import AcquisitionType, LoggingMode, LoggingOperation, UnitsPreScaled, VoltageUnits
+from nidaqmx.system import System
+import pandas as pd
 from PySide6.QtWidgets import (
-    QApplication, QMainWindow, QTabWidget, QWidget, QVBoxLayout, QHBoxLayout,
-    QLabel, QComboBox, QPushButton, QTableWidget, QTableWidgetItem,
-    QCheckBox, QLineEdit, QHeaderView, QAbstractItemView, QFileDialog, QMessageBox
+    QApplication, QMainWindow, QPushButton, QVBoxLayout, QWidget, QTabWidget,
+    QLineEdit, QLabel, QFormLayout, QMessageBox, QFileDialog, QHBoxLayout,
+    QTableView, QHeaderView
 )
-from PySide6.QtCore import Qt, QTimer
-
-try:
-    import nidaqmx
-    from nidaqmx.system import System
-    REAL_DAQ = True
-except ImportError as e:
-    print("nidaqmx ImportError. Running in simulation mode.")
-    print("Détail de l'erreur :", e)
-    REAL_DAQ = False
-except Exception as e:
-    print("Erreur inattendue à l'import de nidaqmx !")
-    print("Détail :", e)
-    REAL_DAQ = False
+from PySide6.QtCore import QTimer, Qt, QAbstractTableModel, QModelIndex
+import pyqtgraph as pg
+import numpy as np
+from collections import deque
+from threading import Thread, Event
+from queue import Queue, Empty
+import re
+from nidaqmx.scale import Scale
 
 CHANNEL_NAMES = {
     'ai0': 'Catenary Voltage',
@@ -34,558 +24,386 @@ CHANNEL_NAMES = {
     'ai3': 'Torque'
 }
 
-SAMPLE_RATE = 50000      # Default simulation params
-ACQ_BUF_SIZE = 500
-AGG_BUF_MULT = 20
-DISP_BUF_MULT = 50
+def clean_channel_name(name):
+    # Remplace tout caractère non alphanumérique par "_"
+    return re.sub(r'\W+', '_', name)
 
-STOP_EVENT = threading.Event()
+class ChannelTableModel(QAbstractTableModel):
+    def __init__(self, df):
+        super().__init__()
+        self._df = df
+
+    def rowCount(self, parent=None):
+        return self._df.shape[0]
+
+    def columnCount(self, parent=None):
+        return self._df.shape[1]
+
+    def data(self, index, role=Qt.DisplayRole):
+        if not index.isValid():
+            return None
+        value = self._df.iloc[index.row(), index.column()]
+        col = self._df.columns[index.column()]
+        if role == Qt.DisplayRole or role == Qt.EditRole:
+            # Pour la colonne active, évite d'afficher True/False
+            return "" if col == "active" else str(value)
+        if role == Qt.CheckStateRole and col == "active":
+            return Qt.Checked if bool(value) else Qt.Unchecked
+        return None
+
+    def setData(self, index, value, role=Qt.EditRole):
+        if not index.isValid():
+            return False
+        col = self._df.columns[index.column()]
+        row = index.row()
+        if role == Qt.CheckStateRole and col == "active":
+            # Fixe ici : on toggle explicitement le booléen
+            current = bool(self._df.iloc[row, index.column()])
+            self._df.iat[row, index.column()] = not current
+            self.dataChanged.emit(index, index, [Qt.CheckStateRole])
+            return True
+        if role == Qt.EditRole:
+            if col in ["scaling_coeff", "offset"]:
+                try:
+                    value = float(value)
+                except ValueError:
+                    return False
+            self._df.iat[row, index.column()] = value
+            self.dataChanged.emit(index, index)
+            return True
+        return False
+
+    def flags(self, index):
+        col = self._df.columns[index.column()]
+        if col == "active":
+            return Qt.ItemIsUserCheckable | Qt.ItemIsEnabled | Qt.ItemIsSelectable
+        else:
+            return Qt.ItemIsEditable | Qt.ItemIsEnabled | Qt.ItemIsSelectable
+
+    def headerData(self, section, orientation, role=Qt.DisplayRole):
+        if role == Qt.DisplayRole:
+            if orientation == Qt.Horizontal:
+                return str(self._df.columns[section])
+            else:
+                return str(self._df.index[section])
+        return None
 
 
-# Configuration tab for selecting device and channels
+class DAQReader(Thread):
+    def __init__(self, task, nb_samples_per_read, data_queue, stop_event):
+        super().__init__()
+        self.task = task
+        self.nb_samples_per_read = nb_samples_per_read
+        self.data_queue = data_queue
+        self.stop_event = stop_event
+
+    def run(self):
+        while not self.stop_event.is_set():
+            try:
+                data = self.task.read(number_of_samples_per_channel=self.nb_samples_per_read, timeout=2.0)
+                self.data_queue.put(data)
+            except nidaqmx.errors.DaqError as e:
+                print("Thread DAQmx ERROR:", e)
+                break
+
+
 class ConfigTab(QWidget):
-    def __init__(self):
+    def __init__(self, channel_df, general_config):
         super().__init__()
-        self.layout = QVBoxLayout(self)
+        self.channel_df = channel_df
+        self.general_config = general_config  # dict-like
 
-        # Selection device
-        dev_layout = QHBoxLayout()
-        self.device_combo = QComboBox()
-        self.refresh_btn = QPushButton("Rafraîchir")
-        dev_layout.addWidget(QLabel("Matériel NI :"))
-        dev_layout.addWidget(self.device_combo)
-        dev_layout.addWidget(self.refresh_btn)
-        dev_layout.addStretch()
-        self.layout.addLayout(dev_layout)
+        main_layout = QVBoxLayout()
 
-        # Tableau channels
-        self.table = QTableWidget()
-        self.table.setColumnCount(5)
-        self.table.setHorizontalHeaderLabels(["Channel ID", "Nom", "Facteur", "Offset", "Activé"])
-        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
-        self.table.setEditTriggers(QAbstractItemView.AllEditTriggers)
-        self.layout.addWidget(self.table)
+        # Ligne de contrôle générale (Sampling Rate + Fichier)
+        form_layout = QHBoxLayout()
+        self.rate_edit = QLineEdit(str(self.general_config["rate"]))
+        form_layout.addWidget(QLabel("Frequence (Hz):"))
+        form_layout.addWidget(self.rate_edit)
 
-        # Sampling rate
-        self.sr_edit = QLineEdit()
-        self.sr_edit.setPlaceholderText("50000")
-        sr_layout = QHBoxLayout()
-        sr_layout.addWidget(QLabel("Sampling rate (Hz):"))
-        sr_layout.addWidget(self.sr_edit)
-        self.layout.addLayout(sr_layout)
+        self.file_edit = QLineEdit(self.general_config["tdms_file"])
+        self.file_btn = QPushButton("Fichier TDMS…")
+        self.file_btn.clicked.connect(self.select_file)
+        form_layout.addWidget(QLabel("Fichier TDMS:"))
+        form_layout.addWidget(self.file_edit)
+        form_layout.addWidget(self.file_btn)
 
-        # Buffer size en ms
-        self.buf_time_edit = QLineEdit()
-        self.buf_time_edit.setPlaceholderText("100")
-        self.buf_time_edit.textChanged.connect(self.update_samples_label)
-        buf_layout = QHBoxLayout()
-        buf_layout.addWidget(QLabel("Durée buffer acquisition (ms):"))
-        buf_layout.addWidget(self.buf_time_edit)
-        self.samples_label = QLabel("Nombre de samples : --")
-        buf_layout.addWidget(self.samples_label)
-        self.layout.addLayout(buf_layout)
+        main_layout.addLayout(form_layout)
 
-        # Connect events
-        self.refresh_btn.clicked.connect(self.refresh_devices)
-        self.device_combo.currentIndexChanged.connect(self.device_changed)
-        self.refresh_devices()
+        # Bouton de détection des channels
+        self.refresh_btn = QPushButton("Détecter channels DAQ")
+        self.refresh_btn.clicked.connect(self.refresh_channels)
+        main_layout.addWidget(self.refresh_btn)
 
-    def refresh_devices(self):
-        self.device_combo.clear()
-        self.table.setRowCount(0)
-        if REAL_DAQ:
-            system = System.local()
-            devs = [d.name for d in system.devices]
+        # Table channels
+        self.table_model = ChannelTableModel(self.channel_df)
+        self.table_view = QTableView()
+        self.table_view.setModel(self.table_model)
+        self.table_view.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        main_layout.addWidget(self.table_view)
+
+        # Enregistrer
+        self.save_btn = QPushButton("Enregistrer config")
+        self.save_btn.clicked.connect(self.save_config)
+        main_layout.addWidget(self.save_btn)
+        self.setLayout(main_layout)
+
+    def select_file(self):
+        file, _ = QFileDialog.getSaveFileName(self, "Sélectionner un fichier TDMS", filter="Fichiers TDMS (*.tdms)")
+        if file:
+            if not file.lower().endswith(".tdms"):
+                file += ".tdms"
+            self.file_edit.setText(file)
+
+    def refresh_channels(self):
+        system = System.local()
+        rows = []
+
+        for device in system.devices:
+            print(f"Détection des channels pour le device: {device.name}")
+            if not device.ai_physical_chans:
+                print(f"Aucun canal analogique trouvé pour le device {device.name}.")
+                continue
+            else:
+                for channel in device.ai_physical_chans:
+                    print(f"  Canal détecté: {channel.name} )")
+                    # Recherche aiX où X est un chiffre
+                    match = re.search(r'ai(\d+)', channel.name)
+                    if match:
+                        ai_id = f'ai{match.group(1)}'
+                        default_name = CHANNEL_NAMES.get(ai_id, channel.name)
+                    else:
+                        default_name = channel.name
+                    rows.append({
+                        "device": device.name,
+                        "channel": channel.name,
+                        "signal_name": default_name,
+                        "scaling_coeff": 1.0,
+                        "offset": 0.0,
+                        "active": True
+                    })
+        if rows:
+            self.channel_df.drop(self.channel_df.index, inplace=True)
+            for row in rows:
+                self.channel_df.loc[len(self.channel_df)] = row
+            print(rows)
+            print(self.channel_df)
+            self.table_model.layoutChanged.emit()
         else:
-            devs = []
-        self.device_combo.addItems(devs)
+            QMessageBox.warning(self, "Detection", "Aucun canal analogique trouvé.")
 
-    def device_changed(self, idx):
-        self.table.setRowCount(0)
-        devname = self.device_combo.currentText()
-        if not devname:
-            return
-        if REAL_DAQ:
-            try:
-                system = System.local()
-                dev = [d for d in system.devices if d.name == devname][0]
-                ai_channels = dev.ai_physical_chans
-                chans = [c.name for c in ai_channels]
-            except Exception as e:
-                print(e)
-                chans = []
-        else:
-            chans = [f"{devname}/ai{i}" for i in range(4)]
 
-        self.table.setRowCount(len(chans))
-        for i, ch in enumerate(chans):
-            ch_id = ch.split('/')[-1]
-            item_id = QTableWidgetItem(ch_id)
-            item_id.setFlags(Qt.ItemIsEnabled)
-            self.table.setItem(i, 0, item_id)
-            default_name = CHANNEL_NAMES.get(ch_id.lower(), ch_id)
-            item_name = QTableWidgetItem(default_name)
-            self.table.setItem(i, 1, item_name)
-            item_factor = QTableWidgetItem("1.0")
-            self.table.setItem(i, 2, item_factor)
-            item_offset = QTableWidgetItem("0.0")
-            self.table.setItem(i, 3, item_offset)
-            cb = QCheckBox()
-            cb.setChecked(True)
-            self.table.setCellWidget(i, 4, cb)
 
-    def update_samples_label(self):
+    def save_config(self):
         try:
-            rate = float(self.sr_edit.text() or 50000)
-            buf_ms = float(self.buf_time_edit.text() or 100)
-            samples = int(rate * buf_ms / 1000)
-            self.samples_label.setText(f"Nombre de samples : {samples}")
-        except Exception:
-            self.samples_label.setText("Nombre de samples : --")
-
-    def get_config(self):
-        dev = self.device_combo.currentText()
-        chans = []
-        for i in range(self.table.rowCount()):
-            ch_id = self.table.item(i, 0).text()
-            name = self.table.item(i, 1).text()
-            factor = float(self.table.item(i, 2).text())
-            offset = float(self.table.item(i, 3).text())
-            cb = self.table.cellWidget(i, 4)
-            active = cb.isChecked()
-            chans.append({
-                'id': ch_id,
-                'name': name,
-                'factor': factor,
-                'offset': offset,
-                'active': active
-            })
-        try:
-            sr = float(self.sr_edit.text())
-        except Exception:
-            sr = 50000
-        try:
-            buf_ms = float(self.buf_time_edit.text())
-        except Exception:
-            buf_ms = 100
-        buf_samples = int(sr * buf_ms / 1000)
-        return {
-            'device': dev,
-            'channels': chans,
-            'sampling_rate': sr,
-            'buffer_time_ms': buf_ms,
-            'buffer_samples': buf_samples
-        }
-
-
-class AcquisitionThread(threading.Thread):
-    def __init__(self, config, acq_queue, disp_queue):
-        super().__init__()
-        self.daemon = True
-        self.config = config
-        self.acq_queue = acq_queue
-        self.disp_queue = disp_queue
-        self.task = None
-        self.is_real_daq = REAL_DAQ
-
-        if self.is_real_daq:
-            # Construction de la task
-            from nidaqmx.constants import AcquisitionType
-            active_ch = [ch for ch in config['channels'] if ch['active']]
-            channel_ids = [f"{config['device']}/{ch['id']}" for ch in active_ch]
-            self.channel_names = [ch['name'] for ch in active_ch]
-            self.factors = np.array([ch['factor'] for ch in active_ch], dtype=np.float64)
-            self.offsets = np.array([ch['offset'] for ch in active_ch], dtype=np.float64)
-            self.channel_names = [ch['name'] for ch in active_ch]
-            self.sampling_rate = config['sampling_rate']
-            self.buffer_samples = config['buffer_samples']
-            self.task = nidaqmx.Task()
-            for ch in channel_ids:
-                self.task.ai_channels.add_ai_voltage_chan(ch)
-            self.task.timing.cfg_samp_clk_timing(
-                rate=self.sampling_rate,
-                sample_mode=AcquisitionType.CONTINUOUS,
-                samps_per_chan=self.buffer_samples
-            )
-            buffer_min_s = 0.25  # 250 ms
-            buffer_min_samples = int(self.sampling_rate * buffer_min_s)
-            self.task.in_stream.input_buf_size = max(buffer_min_samples, self.buffer_samples * 2)
-        else:
-            # Simulation: utilise la même logique pour factors/offsets
-            active_ch = [ch for ch in config['channels'] if ch['active']]
-            self.channel_names = [ch['name'] for ch in active_ch]
-            self.factors = np.array([ch['factor'] for ch in active_ch], dtype=np.float64)
-            self.offsets = np.array([ch['offset'] for ch in active_ch], dtype=np.float64)
-
-        pass
-
-    def run(self):
-        if self.is_real_daq:
-            self.run_daqmx()
-        else:
-            self.run_simulation()
-
-    def run_daqmx(self):
-        try:
-            dt = 1.0 / self.sampling_rate
-            t = 0
-            n_channels = len(self.channel_names)
-            buffer_min_s = 1.0
-            buffer_min_samples = int(self.sampling_rate * buffer_min_s)
-            self.task.in_stream.input_buf_size = max(buffer_min_samples, self.buffer_samples * 2)
-            print(f"Buffer hardware: {self.task.in_stream.input_buf_size} samples")
-            while not STOP_EVENT.is_set():
-                try:
-                    data = np.array(
-                        self.task.read(number_of_samples_per_channel=self.buffer_samples, timeout=10.0)
-                    )
-                    if n_channels == 1:
-                        data = data[np.newaxis, :]
-                    # **Application des facteurs/offsets ici :**
-                    data = data * self.factors[:, np.newaxis] + self.offsets[:, np.newaxis]
-                except nidaqmx.errors.DaqReadError as err:
-                    print("Erreur NI-DAQmx acquisition :\n", err)
-                    # Tu peux ici stopper la tâche proprement ou prévenir l’utilisateur (signal Qt, etc.)
-                    break
-                if n_channels == 1:
-                    data = data[np.newaxis, :]
-                times = np.arange(self.buffer_samples) * dt + t
-                t += self.buffer_samples * dt
-                try:
-                    self.acq_queue.put((times, data), timeout=0.2)
-                    self.disp_queue.put((times, data), timeout=0.2)
-                except:
-                    pass
-        finally:
-            if self.task:
-                self.task.close()
-        try:
-            dt = 1.0 / self.sampling_rate
-            t = 0
-            n_channels = len(self.channel_names)
-            while not STOP_EVENT.is_set():
-                # Cette lecture est BLOQUANTE : attend que le buffer soit plein
-                data = np.array(
-                    self.task.read(number_of_samples_per_channel=self.buffer_samples, timeout=10.0)
-                )
-                # data.shape = (n_channels, N) ou (N,) si 1 canal
-                if n_channels == 1:
-                    data = data[np.newaxis, :]
-                times = np.arange(self.buffer_samples) * dt + t
-                t += self.buffer_samples * dt
-                try:
-                    self.acq_queue.put((times, data), timeout=0.2)
-                    self.disp_queue.put((times, data), timeout=0.2)
-                except:
-                    pass
-                # Plus besoin de sleep ici !
-        finally:
-            if self.task:
-                self.task.close()
-
-    def run_simulation(self):
-        sr = self.config['sampling_rate']
-        N = self.config['buffer_samples']
-        dt = 1.0 / sr
-        t = 0
-        active_ch = [ch for ch in self.config['channels'] if ch['active']]
-        channel_ids = [f"{config['device']}/{ch['id']}" for ch in active_ch]
-        self.channel_names = [ch['name'] for ch in active_ch]
-        self.factors = np.array([ch['factor'] for ch in active_ch], dtype=np.float64)
-        self.offsets = np.array([ch['offset'] for ch in active_ch], dtype=np.float64)
-        n_channels = len(active_ch)
-        freq_list = [10000 + 1000*i for i in range(n_channels)]
-        while not STOP_EVENT.is_set():
-            times = np.arange(N) * dt + t
-            data = np.stack([
-                np.sin(2 * np.pi * freq_list[k] * times)
-                for k in range(n_channels)
-            ])
-            t += N * dt
-            try:
-                self.acq_queue.put((times, data), timeout=0.2)
-                self.disp_queue.put((times, data), timeout=0.2)
-            except:
-                pass
-            time.sleep(N / sr)
-
-
-class AggregationThread(threading.Thread):
-    def __init__(self, acq_queue, agg_queue, agg_buf_mult):
-        super().__init__()
-        self.daemon = True
-        self.acq_queue = acq_queue
-        self.agg_queue = agg_queue
-        self.agg_buf_mult = agg_buf_mult
-        self.times_buf = []
-        self.data_buf = []
-
-    def run(self):
-        while not STOP_EVENT.is_set():
-            try:
-                times, data = self.acq_queue.get(timeout=0.2)
-                self.times_buf.append(times)
-                self.data_buf.append(data)
-                if len(self.times_buf) >= self.agg_buf_mult:
-                    all_times = np.concatenate(self.times_buf)
-                    all_data = np.concatenate(self.data_buf, axis=1)
-                    self.agg_queue.put((all_times, all_data))
-                    self.times_buf.clear()
-                    self.data_buf.clear()
-            except:
-                pass
-
-
-class CsvWriterThread(threading.Thread):
-    def __init__(self, agg_queue, filename, channel_names):
-        super().__init__()
-        self.daemon = True
-        self.agg_queue = agg_queue
-        self.filename = filename
-        self.channel_names = channel_names
-        self.header_written = os.path.exists(self.filename) and os.path.getsize(self.filename) > 0
-
-    def run(self):
-        while not STOP_EVENT.is_set():
-            try:
-                times, data = self.agg_queue.get(timeout=0.2)
-                rows = np.column_stack((times, data.T))
-                with open(self.filename, 'a', newline='') as f:
-                    writer = csv.writer(f)
-                    if not self.header_written:
-                        header = ['time'] + self.channel_names
-                        writer.writerow(header)
-                        self.header_written = True
-                    writer.writerows(rows)
-            except:
-                pass
-
+            self.general_config["rate"] = int(self.rate_edit.text())
+            self.general_config["tdms_file"] = self.file_edit.text()
+            QMessageBox.information(self, "Config", "Paramètres généraux enregistrés.\nLa sélection des channels est automatiquement prise en compte.")
+        except Exception as e:
+            QMessageBox.warning(self, "Erreur", f"Paramètre général invalide : {e}")
 
 class AcquisitionTab(QWidget):
-    def __init__(self):
+    def __init__(self, channel_df, general_config):
         super().__init__()
-        self.layout = QVBoxLayout(self)
-        self.control_layout = QHBoxLayout()
-        self.file_edit = QLineEdit()
-        self.file_edit.setPlaceholderText("Nom du fichier d'enregistrement (.csv)")
-        self.browse_btn = QPushButton("Choisir dossier/fichier")
-        self.start_btn = QPushButton("Start acquisition")
-        self.stop_btn = QPushButton("Stop acquisition")
-        self.stop_btn.setEnabled(False)
-        self.control_layout.addWidget(self.file_edit)
-        self.control_layout.addWidget(self.browse_btn)
-        self.control_layout.addWidget(self.start_btn)
-        self.control_layout.addWidget(self.stop_btn)
-        self.layout.addLayout(self.control_layout)
-        self.graphs = []
-        self.curves = []
-        self.last_config = None
+        self.channel_df = channel_df
+        self.general_config = general_config
+
+        self.layout = QVBoxLayout()
+        self.setLayout(self.layout)
+        self.start_button = QPushButton("Démarrer l'acquisition")
+        self.start_button.clicked.connect(self.start_acquisition)
+        self.layout.addWidget(self.start_button)
+
+        self.plot_widgets = {}
+        self.curves = {}
+        self.time_buffer = {}
+        self.data_buffer = {}
+
         self.timer = QTimer()
+        self.timer.setInterval(500)  # 500 ms
         self.timer.timeout.connect(self.update_plot)
-        self.disp_queue = None
-        self.csv_file = self.default_filename()
 
-        self.file_edit.setText(self.csv_file)
+        self.task = None
+        self.daq_thread = None
+        self.data_queue = None
+        self.stop_event = None
 
-        self.browse_btn.clicked.connect(self.choose_file)
-        self.start_btn.clicked.connect(self.on_start)
-        self.stop_btn.clicked.connect(self.on_stop)
-        self.span_layout = QHBoxLayout()
-        self.span_combo = QComboBox()
-        # Valeurs classiques des oscillos (en ms/div)
-        self.span_values = [
-            0.1, 0.2, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000  # en ms/div
+        self.colors = [
+            (23, 167, 114),
+            (210, 49, 80),
+            (46, 134, 222),
+            (245, 171, 53),
+            (75, 123, 236)
         ]
-        for v in self.span_values:
-            if v < 1000:
-                txt = f"{v:.1f} ms/div" if v < 1 else f"{int(v)} ms/div"
-            else:
-                txt = f"{int(v / 1000)} s/div"
-            self.span_combo.addItem(txt, v)
-        self.span_combo.setCurrentIndex(9)  # par défaut 100 ms/div
-        self.span_layout.addWidget(QLabel("Base de temps:"))
-        self.span_layout.addWidget(self.span_combo)
-        self.span_layout.addStretch()
-        self.layout.addLayout(self.span_layout)
 
-        self.span_combo.currentIndexChanged.connect(self.update_plot)
+    def start_acquisition(self):
+        if self.task is not None:
+            return
 
-        self.start_callback = None  # sera branché par le MainWindow
-        self.stop_callback = None
-
-    def default_filename(self):
-        return os.path.join(os.getcwd(), "acquisition.csv")
-
-    def choose_file(self):
-        dlg = QFileDialog(self)
-        dlg.setAcceptMode(QFileDialog.AcceptSave)
-        dlg.setNameFilter("Fichiers CSV (*.csv)")
-        dlg.setDefaultSuffix("csv")
-        filename, _ = dlg.getSaveFileName(
-            self, "Choisir le fichier d'enregistrement", self.file_edit.text() or self.default_filename(), "Fichiers CSV (*.csv)")
-        if filename:
-            self.file_edit.setText(filename)
-            self.csv_file = filename
-
-    def setup_graphs(self, config, disp_queue):
-        # Nettoyage
-        for g in self.graphs:
-            self.layout.removeWidget(g)
-            g.deleteLater()
-        self.graphs.clear()
+        # Nettoyer plots précédents
+        for w in self.plot_widgets.values():
+            self.layout.removeWidget(w)
+            w.deleteLater()
+        self.plot_widgets.clear()
         self.curves.clear()
-        #mettre le fond blanc
-        pg.setConfigOption('background', 'w')
-        pg.setConfigOption('foreground', 'k')
-        # Garde config + disp_queue
-        self.last_config = config
-        self.disp_queue = disp_queue
-        # Affichage des plots selon les canaux actifs
-        active_channels = [ch for ch in config['channels'] if ch['active']]
-        self.active_channel_names = [ch['name'] for ch in active_channels]
-        self.n_channels = len(active_channels)
-        if not active_channels:
-            self.layout.addWidget(QLabel("Aucun canal activé dans la configuration."))
+        self.data_buffer.clear()
+        self.time_buffer.clear()
+
+        active_channels = self.channel_df[self.channel_df["active"] == True]
+        if active_channels.empty:
+            QMessageBox.warning(self, "Acquisition", "Aucun channel actif sélectionné.")
             return
-        self.display_times = np.zeros(config['buffer_samples'] * DISP_BUF_MULT)
-        self.display_data = np.zeros((self.n_channels, config['buffer_samples'] * DISP_BUF_MULT))
-        for ch in active_channels:
-            plot = pg.PlotWidget(title=ch['name'])
-            curve = plot.plot(pen=pg.mkPen(color= (23, 167, 114) ,width=2))
-            self.layout.addWidget(plot)
-            self.graphs.append(plot)
-            self.curves.append(curve)
 
-    def on_start(self):
-        filename = self.file_edit.text().strip()
-        if not filename:
-            QMessageBox.warning(self, "Erreur", "Veuillez indiquer un nom de fichier de sauvegarde.")
-            return
-        if os.path.exists(filename):
-            reply = QMessageBox.question(self, "Fichier existe déjà", f"Le fichier {filename} existe déjà. L'écraser ?",
-                                         QMessageBox.Yes | QMessageBox.No)
-            if reply == QMessageBox.No:
-                return
-        self.csv_file = filename
-        # Correction ici : utilise .window() pour accéder au MainWindow !
-        mainwin = self.window()
-        config = mainwin.tab_config.get_config()
-        self.last_config = config
-        self.start_btn.setEnabled(False)
-        self.stop_btn.setEnabled(True)
-        if self.start_callback:
-            self.start_callback(config, self.csv_file)
-        self.start_display()
+        channels = [row["channel"] for _, row in active_channels.iterrows()]
+        coeffs = [float(row["scaling_coeff"]) for _, row in active_channels.iterrows()]
+        offsets = [float(row["offset"]) for _, row in active_channels.iterrows()]
+        names = [str(row["signal_name"]) for _, row in active_channels.iterrows()]
 
-    def on_stop(self):
-        self.stop_btn.setEnabled(False)
-        self.start_btn.setEnabled(True)
-        self.stop_display()
-        if self.stop_callback:
-            self.stop_callback()
+        self.rate = int(self.general_config["rate"])
+        self.nb_samples_per_read = int(self.rate // 10)  # 100 ms worth of data
+        self.window_length = self.rate  # 1 seconde de points
 
-    def start_display(self):
-        self.display_times[:] = 0
-        self.display_data[:, :] = 0
-        self.timer.start(30)
+        tdms_file = self.general_config["tdms_file"]
 
-    def stop_display(self):
-        self.timer.stop()
+        self.task = nidaqmx.Task()
+        for idx, ch in enumerate(channels):
+            scale_coeff = coeffs[idx]
+            offset = offsets[idx]
+            scale_name = f"scale_{clean_channel_name(names[idx])}"
+
+            # Crée le custom scale (supprime d'abord s'il existe déjà)
+            try:
+                s = Scale(scale_name)
+                s.delete()
+            except Exception:
+                pass  # Scale n'existait pas
+
+            scale = Scale(scale_name)
+            scale.create_lin_scale(
+                scale_name,
+                slope=scale_coeff,
+                y_intercept=offset,
+                pre_scaled_units=UnitsPreScaled.VOLTS,
+                scaled_units="Volts"
+            )
+
+            self.task.ai_channels.add_ai_voltage_chan(
+                ch,
+                min_val=-10.0 * scale_coeff + offset,
+                max_val=10.0 * scale_coeff + offset,
+                units=nidaqmx.constants.VoltageUnits.FROM_CUSTOM_SCALE,
+                custom_scale_name=scale_name
+            )
+
+        #self.task.in_stream.input_buf_size = 20 * self.rate  # buffer DAQmx large !
+
+        self.task.timing.cfg_samp_clk_timing(
+            rate=self.rate,
+            sample_mode=AcquisitionType.CONTINUOUS,
+            samps_per_chan=self.nb_samples_per_read
+        )
+        self.task.in_stream.configure_logging(
+            tdms_file,
+            LoggingMode.LOG_AND_READ,
+            operation=LoggingOperation.CREATE_OR_REPLACE
+        )
+
+        for idx, name in enumerate(names):
+            plot_widget = pg.PlotWidget(title=f"{name}")
+            plot_widget.setBackground('w')
+            color = self.colors[idx % len(self.colors)]
+            curve = plot_widget.plot(pen=pg.mkPen(color=color, width=2), name=name)
+            self.layout.addWidget(plot_widget)
+            self.plot_widgets[name] = plot_widget
+            self.curves[name] = curve
+            self.data_buffer[name] = deque(maxlen=self.window_length)
+            self.time_buffer[name] = deque(maxlen=self.window_length)
+
+        self.coeffs = coeffs
+        self.offsets = offsets
+        self.names = names
+
+        self.data_queue = Queue()
+        self.stop_event = Event()
+        self.daq_thread = DAQReader(self.task, self.nb_samples_per_read, self.data_queue, self.stop_event)
+        self.task.start()
+        self.daq_thread.start()
+        self.timer.start()
+        self.start_button.setEnabled(False)
 
     def update_plot(self):
-        if self.disp_queue is None:
-            return
+        # Lire tous les paquets dispo dans la queue
         updated = False
         try:
-            while not self.disp_queue.empty():
-                times, data = self.disp_queue.get_nowait()
-                n = len(times)
-                sz = self.display_times.size
-                if n >= sz:
-                    self.display_times[:] = times[-sz:]
-                    self.display_data[:, :] = data[:, -sz:]
-                else:
-                    self.display_times = np.roll(self.display_times, -n)
-                    self.display_data = np.roll(self.display_data, -n, axis=1)
-                    self.display_times[-n:] = times
-                    self.display_data[:, -n:] = data
-                updated = True
+            while True:
+                data = self.data_queue.get_nowait()
+                if isinstance(data, list) and isinstance(data[0], list):
+                    for idx, name in enumerate(self.names):
+                        samples = (np.array(data[idx]) )
+                                   #* self.coeffs[idx] + self.offsets[idx])
+                        n = len(samples)
+                        if n > 0:
+                            if len(self.time_buffer[name]) == 0:
+                                tstart = 0
+                            else:
+                                tstart = self.time_buffer[name][-1] + 1 / self.rate
+                            new_times = np.linspace(tstart, tstart + (n - 1) / self.rate, n)
+                            self.time_buffer[name].extend(new_times)
+                            self.data_buffer[name].extend(samples)
+                            self.curves[name].setData(list(self.time_buffer[name]), list(self.data_buffer[name]))
+                            updated = True
+        except Empty:
+            if not updated:
+                # Affiche le dernier état, même si pas de nouvelle donnée
+                for idx, name in enumerate(self.names):
+                    self.curves[name].setData(list(self.time_buffer[name]), list(self.data_buffer[name]))
+            pass
         except Exception as e:
             print("Erreur update_plot:", e)
-        # Ici, on gère le span comme un oscilloscope
-        ms_per_div = self.span_combo.currentData()
-        ndiv = 10
-        span_s = (ms_per_div * ndiv) / 1000
+            self.stop_acquisition()
 
-        tmax = self.display_times.max()
-        tmin_buf = self.display_times[self.display_times > 0].min() if np.any(self.display_times > 0) else 0
-        span_s_max = tmax - tmin_buf
-        if span_s > span_s_max:
-            span_s = span_s_max
-        tmin = tmax - span_s
-        mask = self.display_times >= tmin
-        for ch, curve in enumerate(self.curves):
-            curve.setData(self.display_times[mask], self.display_data[ch][mask])
-
-
-class MainWindow(QMainWindow):
-    def __init__(self):
-        super().__init__()
-        self.setWindowTitle("Acquisition DAQ NI - Configuration dynamique")
-        self.tabs = QTabWidget()
-        self.tab_config = ConfigTab()
-        self.tab_acq = AcquisitionTab()
-        self.tabs.addTab(self.tab_config, "Configuration")
-        self.tabs.addTab(self.tab_acq, "Acquisition")
-        self.tabs.addTab(QLabel("Tab 3 (à compléter)"), "Tab 3")
-        self.setCentralWidget(self.tabs)
-
-        self.tab_acq.start_callback = self.on_start_acquisition
-        self.tab_acq.stop_callback = self.on_stop_acquisition
-
-        self.config = None
-        self.acq_queue = Queue(maxsize=10)
-        self.agg_queue = Queue(maxsize=10)
-        self.disp_queue = Queue(maxsize=10)
-        self.threads = []
-
-    def on_start_acquisition(self, config, filename):
-        self.config = config
-        STOP_EVENT.clear()
-        self.tab_acq.setup_graphs(self.config, self.disp_queue)
-        self.tab_acq.start_display()
-        active_channels = [ch for ch in self.config['channels'] if ch['active']]
-        channel_names = [ch['name'] for ch in active_channels]
-        self.threads = [
-            AcquisitionThread(self.config, self.acq_queue, self.disp_queue),
-            AggregationThread(self.acq_queue, self.agg_queue, AGG_BUF_MULT),
-            CsvWriterThread(self.agg_queue, filename, channel_names)
-        ]
-        for t in self.threads:
-            t.start()
-
-    def on_stop_acquisition(self):
-        STOP_EVENT.set()
-        for t in self.threads:
-            if t.is_alive():
-                t.join(timeout=2)
-        self.threads = []
-        self.tab_acq.stop_display()
+    def stop_acquisition(self):
+        self.timer.stop()
+        if self.daq_thread is not None and self.daq_thread.is_alive():
+            self.stop_event.set()
+            self.daq_thread.join(timeout=2)
+        if self.task is not None:
+            self.task.stop()
+            self.task.close()
+            self.task = None
+        self.start_button.setEnabled(True)
 
     def closeEvent(self, event):
-        STOP_EVENT.set()
-        for t in self.threads:
-            if t.is_alive():
-                t.join(timeout=2)
-        super().closeEvent(event)
+        self.stop_acquisition()
+        event.accept()
 
 
-def main():
-    app = QApplication(sys.argv)
-    win = MainWindow()
-    win.resize(1000, 600)
-    win.show()
-    sys.exit(app.exec())
+
+
+class MainApp(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("PyDAQmx Acquisition Multi-channels")
+        # DataFrame colonnes pour channels
+        self.channel_df = pd.DataFrame(
+            columns=["device", "channel", "signal_name", "scaling_coeff", "offset", "active"]
+        )
+        # Configuration générale
+        self.general_config = {"rate": 1000, "tdms_file": "donnees.tdms"}
+
+        self.acquisition_tab = AcquisitionTab(self.channel_df, self.general_config)
+        self.config_tab = ConfigTab(self.channel_df, self.general_config)
+        self.tabs = QTabWidget()
+        self.tabs.addTab(self.acquisition_tab, "Acquisition")
+        self.tabs.addTab(self.config_tab, "Configuration")
+        self.setCentralWidget(self.tabs)
+
+    def closeEvent(self, event):
+        self.acquisition_tab.closeEvent(event)
+        event.accept()
 
 if __name__ == "__main__":
-    main()
+    app = QApplication(sys.argv)
+    window = MainApp()
+    window.show()
+    sys.exit(app.exec())
