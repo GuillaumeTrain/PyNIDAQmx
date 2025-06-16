@@ -205,7 +205,7 @@ class ConfigTab(QWidget):
 class AcquisitionTab(QWidget):
     def __init__(self, channel_df, general_config):
         super().__init__()
-        self.channel_df = channel_df
+        self.channel_df =channel_df
         self.general_config = general_config
 
         self.layout = QVBoxLayout()
@@ -378,8 +378,6 @@ class AcquisitionTab(QWidget):
         event.accept()
 
 
-
-
 class MainApp(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -389,7 +387,7 @@ class MainApp(QMainWindow):
             columns=["device", "channel", "signal_name", "scaling_coeff", "offset", "active"]
         )
         # Configuration générale
-        self.general_config = {"rate": 1000, "tdms_file": "donnees.tdms"}
+        self.general_config = {"rate": 50000, "tdms_file": "donnees.tdms"}
 
         self.acquisition_tab = AcquisitionTab(self.channel_df, self.general_config)
         self.config_tab = ConfigTab(self.channel_df, self.general_config)
