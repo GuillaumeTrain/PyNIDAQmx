@@ -6,7 +6,7 @@ import pandas as pd
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QPushButton, QVBoxLayout, QWidget, QTabWidget,
     QLineEdit, QLabel, QFormLayout, QMessageBox, QFileDialog, QHBoxLayout,
-    QTableView, QHeaderView
+    QTableView, QHeaderView, QComboBox
 )
 from PySide6.QtCore import QTimer, Qt, QAbstractTableModel, QModelIndex
 import pyqtgraph as pg
@@ -18,8 +18,8 @@ import re
 from nidaqmx.scale import Scale
 
 CHANNEL_NAMES = {
-    'ai0': 'Catenary Voltage',
-    'ai1': 'Pantograph Current',
+    'ai0': 'Pantograph Current',
+    'ai1': 'Catenary Voltage',
     'ai2': 'Speed',
     'ai3': 'Torque'
 }
@@ -113,13 +113,22 @@ class ConfigTab(QWidget):
         self.channel_df = channel_df
         self.general_config = general_config  # dict-like
 
+        # Déclaration de toutes les valeurs possibles de taux d'échantillonnage
+        self.rate_choices = [50_000 // n for n in range(1, 32)]
+
         main_layout = QVBoxLayout()
 
         # Ligne de contrôle générale (Sampling Rate + Fichier)
         form_layout = QHBoxLayout()
-        self.rate_edit = QLineEdit(str(self.general_config["rate"]))
+        # Remplace QLineEdit par QComboBox
+        self.rate_combo = QComboBox()
+        self.rate_combo.addItems([str(rate) for rate in self.rate_choices])
+        self.rate_combo.setCurrentText(str(self.general_config["rate"]))  # Définir la valeur actuelle à 50kHz
+        self.rate_combo.currentTextChanged.connect(self.on_rate_change)  # Connecter un changement
+
         form_layout.addWidget(QLabel("Frequence (Hz):"))
-        form_layout.addWidget(self.rate_edit)
+        form_layout.addWidget(self.rate_combo)
+
 
         self.file_edit = QLineEdit(self.general_config["tdms_file"])
         self.file_btn = QPushButton("Fichier TDMS…")
@@ -147,6 +156,14 @@ class ConfigTab(QWidget):
         self.save_btn.clicked.connect(self.save_config)
         main_layout.addWidget(self.save_btn)
         self.setLayout(main_layout)
+
+    def on_rate_change(self, text):
+        """Met à jour la fréquence lorsque l'utilisateur change la valeur dans le Combobox."""
+        try:
+            new_rate = int(text)
+            self.general_config["rate"] = new_rate
+        except ValueError:
+            pass
 
     def select_file(self):
         file, _ = QFileDialog.getSaveFileName(self, "Sélectionner un fichier TDMS", filter="Fichiers TDMS (*.tdms)")
@@ -196,7 +213,7 @@ class ConfigTab(QWidget):
 
     def save_config(self):
         try:
-            self.general_config["rate"] = int(self.rate_edit.text())
+            self.general_config["rate"] = int(self.rate_combo.currentText())
             self.general_config["tdms_file"] = self.file_edit.text()
             QMessageBox.information(self, "Config", "Paramètres généraux enregistrés.\nLa sélection des channels est automatiquement prise en compte.")
         except Exception as e:
@@ -210,9 +227,14 @@ class AcquisitionTab(QWidget):
 
         self.layout = QVBoxLayout()
         self.setLayout(self.layout)
+        self.button_layout = QHBoxLayout()
         self.start_button = QPushButton("Démarrer l'acquisition")
         self.start_button.clicked.connect(self.start_acquisition)
-        self.layout.addWidget(self.start_button)
+        self.stop_button = QPushButton("Stoper l'acquisition")
+        self.stop_button.clicked.connect(self.stop_acquisition)
+        self.button_layout.addWidget(self.start_button)
+        self.button_layout.addWidget(self.stop_button)
+        self.layout.addLayout(self.button_layout)
 
         self.plot_widgets = {}
         self.curves = {}
@@ -269,7 +291,8 @@ class AcquisitionTab(QWidget):
         for idx, ch in enumerate(channels):
             scale_coeff = coeffs[idx]
             offset = offsets[idx]
-            scale_name = f"scale_{clean_channel_name(names[idx])}"
+            name = clean_channel_name(names[idx])
+            scale_name = f"scale_{name}"
 
             # Crée le custom scale (supprime d'abord s'il existe déjà)
             try:
@@ -292,7 +315,8 @@ class AcquisitionTab(QWidget):
                 min_val=-10.0 * scale_coeff + offset,
                 max_val=10.0 * scale_coeff + offset,
                 units=nidaqmx.constants.VoltageUnits.FROM_CUSTOM_SCALE,
-                custom_scale_name=scale_name
+                custom_scale_name=scale_name,
+                name_to_assign_to_channel=name,
             )
 
         #self.task.in_stream.input_buf_size = 20 * self.rate  # buffer DAQmx large !
