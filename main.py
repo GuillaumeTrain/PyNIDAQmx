@@ -642,7 +642,7 @@ class AcquisitionTab(QWidget):
             # Pour chaque device/plot actif
             for device, data in data_by_device.items():
                 active_channel_mask = (self.channel_df["active"] == True) & (self.channel_df["device"] == device)
-                active_signals = self.channel_df[active_channel_mask][" signal_name"].tolist()
+                active_signals = self.channel_df[active_channel_mask]["signal_name"].tolist()
                 for idx, signal_name in enumerate(active_signals):
                     if n > 0 and idx < len(data):
                         samples = np.array(data[idx][:n])
